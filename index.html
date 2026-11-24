@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>密钥扫描误报分诊 · 粘贴即判</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#242a35;--fg:#e6e9ef;--dim:#9aa4b2;--ok:#12b76a;--bad:#f04438;--warn:#f79009}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--fg)}
+  .wrap{max-width:900px;margin:0 auto;padding:28px 18px 60px}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:var(--dim);margin:0 0 22px;font-size:14px}
+  textarea{width:100%;height:170px;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:12px;font:13px/1.5 ui-monospace,Menlo,monospace;resize:vertical}
+  .row{display:flex;gap:10px;align-items:center;margin:12px 0 22px;flex-wrap:wrap}
+  button{background:#2f6feb;color:#fff;border:0;border-radius:9px;padding:10px 18px;font-size:15px;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--dim)}
+  .stat{display:flex;gap:22px;margin:0 0 18px;flex-wrap:wrap}
+  .kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;min-width:130px}
+  .kpi b{display:block;font-size:24px;line-height:1.2}
+  .kpi span{color:var(--dim);font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:500}
+  code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+  .tag{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11.5px;border:1px solid}
+  .t-real{color:var(--bad);border-color:var(--bad)}
+  .t-fixture,.t-rulefile,.t-doc,.t-artifact,.t-detector,.t-snapshot{color:var(--dim);border-color:var(--line)}
+  .note{color:var(--dim);font-size:12.5px;margin-top:18px;line-height:1.7}
+  a{color:#79a6ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>密钥扫描误报分诊 · 粘贴即判</h1>
+  <p class="sub">把你的扫描器报告粘进来，立刻看到<b>哪几条是真泄露</b>。纯浏览器本地计算，不上传、不联网、不需要注册。</p>
+
+  <textarea id="in" placeholder='支持三种格式，任选其一粘贴：
+① gitleaks JSON:   [{"File":"tests/a.spec.ts","StartLine":3,"RuleID":"aws"}]
+② SARIF:           {"runs":[{"results":[{"locations":[{"physicalLocation":{...}}]}]}]}
+③ 任意含 路径:行号 的文本:  rules/aws.yml:16:1 aws-access-token'></textarea>
+
+  <div class="row">
+    <button id="go">判定</button>
+    <button class="ghost" id="demo">载入示例</button>
+    <span id="msg" style="color:var(--dim);font-size:13px"></span>
+  </div>
+
+  <div class="stat" id="stat" style="display:none">
+    <div class="kpi"><b id="k-total">0</b><span>候选总数</span></div>
+    <div class="kpi"><b id="k-real" style="color:var(--bad)">0</b><span>真需处理</span></div>
+    <div class="kpi"><b id="k-tri" style="color:var(--ok)">0</b><span>可排除</span></div>
+  </div>
+
+  <div id="out"></div>
+
+  <p class="note">
+    <b>判定规则</b>（只看路径与规则名，不读你的代码）：测试夹具 / 扫描规则文件 / 文档模板 / 构建产物 / 检测器自身 / 知识库快照 → 排除；其余一律判"真"，<b>宁严不宽</b>。<br>
+    <b>我不是渗透测试，也不承诺你的代码安全。</b>"0 处真泄露"只代表：在我覆盖的 6 类特征里没发现真的。<br>
+    需要逐条带依据的正式报告（含行动清单，先撤销凭据还是先改代码）→ 见 <a href="https://github.com/zjdyzww/ai-code-health" target="_blank">项目仓库</a>。
+  </p>
+</div>
+
+<script>
+const RULES = [
+  ['fixture', p => /(^|\/)(tests?|__tests__|spec|specs|fixtures?|testdata|e2e)(\/|$)/.test(p) || /(_test\.go|\.spec\.[jt]sx?|\.test\.[jt]sx?|(^|\/)test_.*\.py)$/.test(p)],
+  ['rulefile', p => /(gitleaks\.toml|\.gitleaks|detect-secrets|secrets?[-_]?baseline|secret-patterns?)/.test(p) || /(^|\/)(rules|signatures|patterns|detectors)(\/|$)/.test(p) || /(regex|regexes|patterns?|signatures?|rules?)\.[a-z]+$/.test(p)],
+  ['doc', p => /\.(md|mdx|txt)$/.test(p) || p.includes('/docs/')],
+  ['artifact', p => /(^|\/)(lib|dist|build|out|chunks|vendor)(\/|$)/.test(p) || /\.min\.(js|css)$/.test(p)],
+  ['detector', p => /(verify|check|scan|audit|guard|lint)[-_\w]*secret|secret[-_]?(scan|check|detect|guard)/.test(p)],
+  ['snapshot', p => /\.(json|ndjson|jsonl)$/.test(p) && /(store|snapshot|corpus|knowledge|okf|memory)/.test(p)],
+];
+const LABEL = {fixture:'测试夹具',rulefile:'扫描规则文件',doc:'文档/模板',artifact:'构建产物',detector:'检测器自身',snapshot:'知识库快照',real:'真需处理'};
+
+function classify(rel, rule){
+  const p = String(rel).toLowerCase();
+  for (const [b, f] of RULES) if (f(p)) return b;
+  if (rule && /(test|fixture|example|dummy|sample)/i.test(rule)) return 'fixture';
+  return 'real';
+}
+function parse(raw){
+  const text = String(raw||''); let parsed=null;
+  try { parsed = JSON.parse(text); } catch(e) { parsed = null; }
+  if (Array.isArray(parsed)) {
+    const out=[];
+    for (const it of parsed) {
+      const f = it && (it.File||it.file||it.path);
+      if (f) out.push({file:String(f), line:Number(it.StartLine||it.line||0)||null, rule:it.RuleID||it.rule||null});
+    }
+    if (out.length) return out;
+    const tr=[]; for (const it of parsed) {
+      const d = it && it.SourceMetadata && it.SourceMetadata.Data; if (!d) continue;
+      const loc = d.Filesystem||d.Git||d.GitHub||d.S3||{};
+      const f = loc.file||loc.filename||(Array.isArray(loc.files)?loc.files[0]:null);
+      if (f) tr.push({file:String(f), line:Number(loc.line||0)||null, rule:it.DetectorName||null});
+    }
+    if (tr.length) return tr;
+  }
+  if (parsed && Array.isArray(parsed.runs)) {
+    const out=[];
+    for (const run of parsed.runs) for (const res of (run.results||[])) for (const loc of (res.locations||[])) {
+      const u = loc && loc.physicalLocation && loc.physicalLocation.artifactLocation && loc.physicalLocation.artifactLocation.uri;
+      if (u) out.push({file:String(u).replace(/^file:\/\//,''), line:Number(loc.physicalLocation.region&&loc.physicalLocation.region.startLine)||null, rule:res.ruleId||null});
+    }
+    if (out.length) return out;
+  }
+  const out=[], seen=new Set();
+  for (const line of text.split('\n')) {
+    const m = line.match(/([\w./@-]+\.[A-Za-z0-9]+):(\d+)/);
+    if (!m || seen.has(m[1]+':'+m[2])) continue;
+    seen.add(m[1]+':'+m[2]);
+    out.push({file:m[1], line:Number(m[2]), rule:null});
+  }
+  return out;
+}
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function run(){
+  const raw = document.getElementById('in').value;
+  const msg = document.getElementById('msg');
+  const items = parse(raw);
+  if (!items.length) { msg.textContent = '没解析出条目：检查是否是 gitleaks JSON / SARIF / 含 路径:行号 的文本'; document.getElementById('stat').style.display='none'; document.getElementById('out').innerHTML=''; return; }
+  const groups = {real:[],fixture:[],rulefile:[],doc:[],artifact:[],detector:[],snapshot:[]};
+  for (const it of items) {
+    const rel = it.file.replace(/^\.\//,'');
+    groups[classify(rel, it.rule)].push(rel + (it.line? ':'+it.line : '') + (it.rule? ' ['+it.rule+']' : ''));
+  }
+  const real = groups.real.length, tri = items.length - real;
+  document.getElementById('stat').style.display='flex';
+  document.getElementById('k-total').textContent = items.length;
+  document.getElementById('k-real').textContent = real;
+  document.getElementById('k-tri').textContent = tri;
+  let html = '';
+  const order = ['real','fixture','rulefile','doc','artifact','detector','snapshot'];
+  const shown = order.filter(k => groups[k].length);
+  if (!shown.length) html = '<p class="note">没有条目。</p>';
+  else {
+    html = '<table><thead><tr><th style="width:120px">判定</th><th>条目</th></tr></thead><tbody>';
+    for (const k of shown) for (const row of groups[k].slice(0, 200))
+      html += `<tr><td><span class="tag t-${k}">${LABEL[k]}</span></td><td><code>${esc(row)}</code></td></tr>`;
+    html += '</tbody></table>';
+    if (items.length > 200) html += '<p class="note">仅显示前 200 条。</p>';
+  }
+  document.getElementById('out').innerHTML = html;
+  msg.textContent = real ? `发现 ${real} 条需要处理 —— 先撤销凭据，再改代码。` : `没有真泄露（在 6 类特征范围内）。`;
+}
+document.getElementById('go').onclick = run;
+document.getElementById('demo').onclick = () => {
+  document.getElementById('in').value = JSON.stringify([
+    {File:'rules/aws.yml', StartLine:16, RuleID:'aws-access-token'},
+    {File:'tests/redact.spec.ts', StartLine:44, RuleID:'aws-access-token'},
+    {File:'docs/example-env.md', StartLine:5, RuleID:'generic-api-key'},
+    {File:'src/leak.js', StartLine:2, RuleID:'github-pat'}
+  ], null, 2);
+  run();
+};
+</script>
+</body>
+</html>
